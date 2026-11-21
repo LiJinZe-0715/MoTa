@@ -382,11 +382,65 @@
 
   /* ---------- 消息栏 ---------- */
 
+  /* 札记落盘（DESIGN §8.9）：刷新、读档后札记还在；调试模式用自己的键（.debug） */
+  var MSG_STORE_KEY = 'emberTower.messages';
+
+  function msgStoreKey() {
+    var debug = false;
+    try {
+      debug = !!(window.Game && typeof window.Game.isDebug === 'function' && window.Game.isDebug());
+    } catch (err) { debug = false; }
+    return MSG_STORE_KEY + (debug ? '.debug' : '');
+  }
+
+  /* 读回札记；内容坏了就当没有，照常从空开始 */
+  function loadStoredMessages() {
+    var out = { list: [], seq: 0 };
+    var raw = null;
+    try { raw = window.localStorage.getItem(msgStoreKey()); } catch (err) { return out; }
+    if (!raw) { return out; }
+    var data = null;
+    try { data = JSON.parse(raw); } catch (err) { return out; }
+    if (!data || typeof data !== 'object' || !Array.isArray(data.list)) { return out; }
+    if (typeof data.seq === 'number' && isFinite(data.seq) && data.seq > 0) { out.seq = data.seq; }
+    for (var i = 0; i < data.list.length && out.list.length < MAX_MSG; i++) {
+      var m = data.list[i];
+      if (!m || typeof m.id !== 'number' || !isFinite(m.id) || typeof m.text !== 'string') { continue; }
+      out.list.push({ id: m.id, text: m.text, kind: (typeof m.kind === 'string' && m.kind) ? m.kind : 'info' });
+      if (m.id > out.seq) { out.seq = m.id; }
+    }
+    return out;
+  }
+
+  function saveMessages() {
+    try {
+      window.localStorage.setItem(msgStoreKey(), JSON.stringify({ seq: msgSeq, list: messages }));
+    } catch (err) { /* 存储不可用或存不下就当没有 */ }
+  }
+
+  function clearStoredMessages() {
+    messages.length = 0;
+    msgSeq = 0;
+    try { window.localStorage.removeItem(msgStoreKey()); } catch (err) { /* 忽略 */ }
+  }
+
+  function restoreMessages() {
+    var saved = loadStoredMessages();
+    messages = saved.list;
+    msgSeq = saved.seq;
+    msgSig = null;
+    lastTopMsg = 0;
+  }
+
   function pushMessage(text, kind) {
     if (!text) { return; }
     msgSeq += 1;
     messages.unshift({ id: msgSeq, text: String(text), kind: kind || 'info' });
     if (messages.length > MAX_MSG) { messages.length = MAX_MSG; }
+    saveMessages();
+    if (window.RunLog && typeof window.RunLog.message === 'function') {
+      try { window.RunLog.message(String(text), kind || 'info'); } catch (err) { /* 日志不能影响游戏 */ }
+    }
     renderMessages();
   }
 
@@ -799,7 +853,7 @@
     routeLog({ t: 'new' });
     started = true;
     closeAll();
-    messages.length = 0;
+    clearStoredMessages();
     msgSig = null;
     lastTopMsg = 0;
     shown = {};
@@ -815,9 +869,8 @@
       started = true;
       routeLog({ t: 'load' });
       closeAll();
-      messages.length = 0;
-      msgSig = null;
-      lastTopMsg = 0;
+      /* 读档先恢复上次的札记，再追加“回到存档”，不清空（DESIGN §8.9） */
+      restoreMessages();
       shown = {};
       resetShopTracking();
       pushMessage('回到存档：' + window.Game.getFloorName(), 'floor');

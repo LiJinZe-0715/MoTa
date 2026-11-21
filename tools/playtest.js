@@ -267,6 +267,7 @@ function Player(profile) {
   }
   var evenCount = 0;
   var minHp = Infinity, minHpAt = '';
+  var fightLog = [];
   this.run = function () {
     var guard = 0;
     for (;;) {
@@ -315,6 +316,13 @@ function Player(profile) {
           if (tryG && before >= tryG.price && profile.shop !== 'none') { Game.buyGoods(tryG.id); continue; }
           if (aG && before >= aG.price && profile.shop !== 'none') { Game.buyGoods(aG.id); continue; }
         } else if (hpG && before >= hpG.price && profile.shop !== 'none') { Game.buyGoods(profile.shop === 'atk' ? shopId('atk').id : hpG.id); continue; }
+        /* 卡住时挡路的怪也记下来（block: true，dmg = 预计掉血；打不动记成 2 倍当前血），调数值时才看得到「打不过的那只」 */
+        Object.keys(ex.frontier).forEach(function (k) {
+          var fb = ex.frontier[k];
+          if (type(fb.ch) !== 'monster' || fb.f !== Game.state.maxFloor) return;   // 只记最高层（主线上）挡路的
+          var inf = Game.getBattleInfo(fb.ch), h0 = Game.state.hero;
+          fightLog.push({ f: fb.f + 1, m: fb.ch, atk: h0.atk, def: h0.def, hp: h0.hp, dmg: inf.canHit ? inf.damage : 2 * h0.hp, block: true });
+        });
         return finish('卡住');
       }
       var c;
@@ -332,7 +340,10 @@ function Player(profile) {
       }
       if (c.buy) Game.buyGoods(c.buy);
       walk(pathTo(ex, c.b.from));
+      var pre = { atk: Game.state.hero.atk, def: Game.state.hero.def, hp: Game.state.hero.hp };
       var ev = Game.move(c.b.dir);
+      /* 逐场战斗记录（FIGHTS_OUT 用）：打这只怪时主角的攻防血和掉血 */
+      if (c.kind === 'fight') fightLog.push({ f: c.b.f + 1, m: c.b.ch, atk: pre.atk, def: pre.def, hp: pre.hp, dmg: pre.hp - Game.state.hero.hp });
       var hit = ev.filter(function (e) { return e.type === 'battle' || e.type === 'door'; })[0];
       if (!hit) return finish('意外被拦：' + JSON.stringify(ev));
       var fl = c.b.f + 1;
@@ -343,7 +354,7 @@ function Player(profile) {
     function finish(result) {
       checkActs(result === '通关');
       var h = Game.state.hero;
-      return { result: result, actSnaps: actSnaps, floorSnaps: floorSnaps, minHp: minHp, minHpAt: minHpAt, floor: Game.state.floor + 1, maxFloor: Game.state.maxFloor + 1, hp: h.hp, atk: h.atk, def: h.def, gold: h.gold, keys: h.keys, log: log, floorLog: floorLog };
+      return { result: result, actSnaps: actSnaps, floorSnaps: floorSnaps, minHp: minHp, minHpAt: minHpAt, floor: Game.state.floor + 1, maxFloor: Game.state.maxFloor + 1, fights: fightLog, hp: h.hp, atk: h.atk, def: h.def, gold: h.gold, keys: h.keys, log: log, floorLog: floorLog };
     }
   };
 }
@@ -541,6 +552,10 @@ if (process.argv.indexOf('--sweep') >= 0) {
     });
     if (process.env.FLOORS_OUT) require('fs').writeFileSync(process.env.FLOORS_OUT, JSON.stringify(floorJson));
   }
+  /* FIGHTS_OUT=文件：每局的逐场战斗记录（买法、结果、每场的层 / 怪 / 打之前的攻防血 / 掉血），调怪物数值用 */
+  if (process.env.FIGHTS_OUT) require('fs').writeFileSync(process.env.FIGHTS_OUT, JSON.stringify(runs.map(function (x) {
+    return { shop: x.shop, fw: x.fw, kw: x.kw, rs: x.rs, result: x.r.result, maxFloor: x.r.maxFloor, acts: x.r.actSnaps, fights: x.r.fights };
+  })));
   SHOPS.forEach(function (shop) {
     var a = runs.filter(function (x) { return x.shop === shop; }), w = a.filter(function (x) { return x.r.result === '通关'; });
     var hps = w.map(function (x) { return x.r.hp; }).sort(function (p, q2) { return p - q2; });

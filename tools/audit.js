@@ -102,6 +102,7 @@ monIds.forEach(function (aid) {
     var actA = actOf(seenMon[aid]);
     if (!actA || actA !== actOf(seenMon[bid])) return;
     var a = data.monsters[aid], b = data.monsters[bid];
+    if (isBoss(a) || isBoss(b)) return;
     if (a.hp >= b.hp && a.atk >= b.atk && a.def >= b.def &&
         (a.hp > b.hp || a.atk > b.atk || a.def > b.def) && a.gold <= b.gold) {
       fail('第' + actNo(actA) + '幕 怪物 ' + a.name + '（' + a.hp + '/' + a.atk + '/' + a.def + '，' + a.gold + ' 金）数值不低于 ' + b.name + '（' + b.hp + '/' + b.atk + '/' + b.def + '，' + b.gold + ' 金），金币却不比它多');
@@ -152,6 +153,13 @@ maps.forEach(function (rows, i) {
         typeOf(rows[y + 1][x]) === 'wall' && typeOf(rows[y + 1][x + 1]) === 'wall') {
       fail('F' + (i + 1) + ' (' + x + ',' + y + ') 起有 2×2 的墙块（墙最多一格厚）');
     }
+  }
+});
+
+/* ---------- 1b2. 偶数坐标必为墙：x、y 都为偶数的格子必须是墙（含外圈） ---------- */
+maps.forEach(function (rows, i) {
+  for (var yy = 0; yy < N; yy += 2) for (var xx = 0; xx < N; xx += 2) {
+    if (typeOf(rows[yy][xx]) !== 'wall') fail('F' + (i + 1) + ' (' + xx + ',' + yy + ') 偶数坐标必须是墙');
   }
 });
 
@@ -249,20 +257,17 @@ maps.forEach(function (rows, fi) {
   }
 
   /* (c) 楼梯只放左下 (1,9) 和右上 (9,1)：单数层下楼梯（第 1 层是出生点）在左下、上楼梯在右上，
-   *     双数层反过来；楼梯所在的角开成 2×2 小空场（两个邻格和斜对角都不是墙），邻格和斜对角不放怪、不放门 */
+   *     双数层反过来。楼梯外侧紧邻格必为墙（左下右边、右上左边），楼梯格本身可进入。 */
   var odd = fi % 2 === 0;
   var BL = [1, N - 2], TR = [N - 2, 1];
   var want = [[fi === 0 ? '@' : '<', odd ? BL : TR]];
   if (find(fi, '>').length) want.push(['>', odd ? TR : BL]);
   want.forEach(function (w) {
     var ch = w[0], p = w[1];
-    if (rows[p[1]][p[0]] !== ch) { fail('F' + (fi + 1) + ' ' + (ch === '@' ? '出生点' : ch === '<' ? '下楼梯' : '上楼梯') + '应在 (' + p[0] + ',' + p[1] + ')'); return; }
-    var dx = p[0] === 1 ? 1 : -1, dy = p[1] === 1 ? 1 : -1;
-    [[p[0] + dx, p[1]], [p[0], p[1] + dy], [p[0] + dx, p[1] + dy]].forEach(function (c) {
-      var t = typeOf(rows[c[1]][c[0]]);
-      if (t === 'wall' || t === 'monster' || t === 'door') fail('F' + (fi + 1) + ' (' + p[0] + ',' + p[1] + ') 的楼梯角没开成 2×2：(' + c[0] + ',' + c[1] + ') 是' + (t === 'wall' ? '墙' : t === 'monster' ? '怪' : '门'));
-    });
+    if (rows[p[1]][p[0]] !== ch) { fail('F' + (fi + 1) + ' ' + (ch === '@' ? '出生点' : ch === '<' ? '下楼梯' : '上楼梯') + '应在 (' + p[0] + ',' + p[1] + ')'); }
   });
+  if (typeOf(rows[N - 2][2]) !== 'wall') fail('F' + (fi + 1) + ' 左下楼梯右边 (2,' + (N - 2) + ') 必须是墙');
+  if (typeOf(rows[1][N - 3]) !== 'wall') fail('F' + (fi + 1) + ' 右上楼梯左边 (' + (N - 3) + ',1) 必须是墙');
 });
 
 /* ---------- 跨层连通 ---------- */
@@ -309,11 +314,12 @@ for (f = 0; f < F; f++) for (var y = 0; y < N; y++) for (var x = 0; x < N; x++) 
     for (var f = 0; f < F; f++) for (var y = 0; y < N; y++) for (var x = 0; x < N; x++) {
       var ch = maps[f][y][x];
       if (MONEY_ITEMS.indexOf(ch) >= 0 && all[f + ',' + x + ',' + y] && !seen[f + ',' + x + ',' + y]) out.push(ch);
+      if (data.monsters[ch] && all[f + ',' + x + ',' + y] && !seen[f + ',' + x + ',' + y]) out.mons = (out.mons || []).concat([data.monsters[ch].name]);
     }
     return out;
   }
   /* 除红门（幕末入口）外所有门都当墙还能走到的格子 = 不用钥匙就拿得到 */
-  var free = flood(function (f, x, y, ch) { return typeOf(ch) === 'door' && ch !== 'R'; });
+  var free = flood(function (f, x, y, ch) { return typeOf(ch) === 'door'; });
   function statPrice(actId) {
     var act = data.acts.filter(function (a) { return a.id === actId; })[0];
     if (!act) return null;
@@ -340,11 +346,15 @@ for (f = 0; f < F; f++) for (var y = 0; y < N; y++) for (var x = 0; x < N; x++) 
       if (typeOf(ch) !== 'door') continue;
       var ex = exclusive(f, x, y), gems = ex.filter(function (e) { return e === 'g' || e === 'd'; }).length;
       if (ch === 'Y') {
-        var bigs = ex.filter(function (e) { return e === 'H'; }).length;
-        var other = ex.filter(function (e) { return 'gdH'.indexOf(e) < 0; });
-        if (gems > 1 || bigs > 1 || other.length) fail('F' + (f + 1) + ' 黄门 (' + x + ',' + y + ') 后面只能放一颗宝石（可再加一瓶大灯油），现在是：' + ex.join(''));
+        var hs = ex.filter(function (e) { return e === 'h'; }).length;
+        var other = ex.filter(function (e) { return 'hgd'.indexOf(e) < 0; });
+        if (hs !== 1 || gems !== 1 || other.length) fail('F' + (f + 1) + ' 黄门 (' + x + ',' + y + ') 后面必须恰好一瓶小灯油 + 一颗宝石，不放别的，现在是：' + ex.join(''));
       }
-      if (ch === 'B') ex.forEach(function (e) { if (e === 'S' || e === 'Z') sz[e] = true; });
+      if (ch === 'B') {
+        ex.forEach(function (e) { if (e === 'S' || e === 'Z') sz[e] = true; });
+        var sw = ex.filter(function (e) { return e === 'S' || e === 'Z'; }).length, hb = ex.filter(function (e) { return e === 'H'; }).length;
+        if (sw !== 1 || hb !== 1 || ex.length !== 2 || (ex.mons && ex.mons.length)) fail('F' + (f + 1) + ' 蓝门 (' + x + ',' + y + ') 后面只放剑或盾一件、大灯油一瓶，不放宝石和怪，现在是：' + ex.join('') + (ex.mons ? ' 怪：' + ex.mons.join('、') : ''));
+      }
       if (ch === 'R') {
         if (f !== act.to - 2) fail('F' + (f + 1) + ' 红门应在第 ' + (act.to - 1) + ' 层，守最后一层的入口');
         var seenR = flood(function (ff, xx, yy) { return ff === f && xx === x && yy === y; });
@@ -356,16 +366,51 @@ for (f = 0; f < F; f++) for (var y = 0; y < N; y++) for (var x = 0; x < N; x++) 
     if ((c.r || 0) !== 1 || (c.R || 0) !== 1) fail(tag + '红钥匙、红门各 1（现在 ' + (c.r || 0) + ' / ' + (c.R || 0) + '）');
     if ((c.b || 0) !== 2 || (c.B || 0) !== 2) fail(tag + '蓝钥匙、蓝门各 2（现在 ' + (c.b || 0) + ' / ' + (c.B || 0) + '）');
     if (!sz.S || !sz.Z) fail(tag + '剑和盾都要在蓝门后');
-    var gap = (c.Y || 0) - (c.y || 0);
-    if (gap < 0 || gap > 2) fail(tag + '黄门比地图上的黄钥匙最多多 2 扇（现在 黄钥 ' + (c.y || 0) + ' / 黄门 ' + (c.Y || 0) + '）');
+    if ((c.y || 0) !== 15 || (c.Y || 0) !== 20) fail(tag + '黄钥匙、黄门各 15 / 20（现在 黄钥 ' + (c.y || 0) + ' / 黄门 ' + (c.Y || 0) + '）');
     if ((c.g || 0) !== 10 || (c.d || 0) !== 10) fail(tag + '红、蓝宝石各 10 颗（现在 ' + (c.g || 0) + ' / ' + (c.d || 0) + '）');
     if ((c.h || 0) !== 20 || (c.H || 0) !== 5) fail(tag + '小灯油 20 瓶、大灯油 5 瓶（现在 ' + (c.h || 0) + ' / ' + (c.H || 0) + '）');
     maps[act.to - 1].forEach(function (row) { for (var i = 0; i < row.length; i++) { var m = data.monsters[row[i]];
       if (m && !m.boss && m.kind.length < 2) fail('F' + act.to + ' 最后一层只放双标签的怪：' + m.name + '（' + m.kind + '）'); } });
     var p = statPrice(act.id), pn = statPrice(act.id + 1);
-    if (p && gold !== 20 * p) fail(tag + '除首领外的金币合计应为 20 次商店 = ' + 20 * p + '（现在 ' + gold + '）');
+    var kp = data.shop.goods.filter(function (g) { return g.effect && g.effect.yellow && (g.showFloor || 1) === act.from; })[0];
+    var want = p ? 20 * p + 5 * (kp ? kp.price : 0) : null;
+    if (want && gold !== want) fail(tag + '除首领外的金币合计应为 20 次商店 + 5 把黄钥匙 = ' + want + '（现在 ' + gold + '）');
     var boss = data.monsters[act.boss];
-    if (pn && boss && boss.gold !== pn) fail(tag + '首领金币应为下一幕一次商店 = ' + pn + '（现在 ' + boss.gold + '）');
+    if (boss && boss.gold !== 0) fail(tag + '首领金币应为 0（现在 ' + boss.gold + '）');
+  });
+})();
+
+/* 2e. 守宝石的怪：高攻（标签含 A 不含 D）只守蓝宝石，高防（含 D 不含 A）只守红宝石。
+ * 「守」= 从楼梯 / 出生点出发、不经过这只怪就走不到（门和别的怪当能过） */
+(function () {
+  maps.forEach(function (g, f) {
+    var starts = [];
+    for (var y = 0; y < N; y++) for (var x = 0; x < N; x++) if ('<>@'.indexOf(g[y][x]) >= 0) starts.push([x, y]);
+    function reach(bx, by) {
+      var seen = {}, q = starts.slice();
+      q.forEach(function (s) { seen[s[0] + ',' + s[1]] = 1; });
+      while (q.length) {
+        var c = q.shift();
+        for (var i = 0; i < 4; i++) {
+          var nx = c[0] + DIRS[i][0], ny = c[1] + DIRS[i][1];
+          if (nx < 0 || ny < 0 || nx >= N || ny >= N || seen[nx + ',' + ny] || typeOf(g[ny][nx]) === 'wall' || (nx === bx && ny === by)) continue;
+          seen[nx + ',' + ny] = 1; q.push([nx, ny]);
+        }
+      }
+      return seen;
+    }
+    var all = reach(-1, -1);
+    for (var y2 = 0; y2 < N; y2++) for (var x2 = 0; x2 < N; x2++) {
+      var m = data.monsters[g[y2][x2]];
+      if (!m || m.boss) continue;
+      var hiA = m.kind.indexOf('A') >= 0 && m.kind.indexOf('D') < 0, hiD = m.kind.indexOf('D') >= 0 && m.kind.indexOf('A') < 0;
+      if (!hiA && !hiD) continue;
+      var r = reach(x2, y2), wrong = hiA ? 'g' : 'd';
+      for (var yy = 0; yy < N; yy++) for (var xx = 0; xx < N; xx++) {
+        if (all[xx + ',' + yy] && !r[xx + ',' + yy] && g[yy][xx] === wrong)
+          fail('F' + (f + 1) + ' (' + x2 + ',' + y2 + ') ' + m.name + '（' + m.kind + '）守着' + (wrong === 'g' ? '红' : '蓝') + '宝石 (' + xx + ',' + yy + ')：高攻只守蓝宝石，高防只守红宝石');
+      }
+    }
   });
 })();
 

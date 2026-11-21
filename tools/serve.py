@@ -11,6 +11,10 @@
 另有成绩接口（design/DESIGN.md §8.7）：
     POST /api/clears  收一条「打通一幕」的成绩，追加到 logs/clears.jsonl（同 id 不重复写）
     GET  /api/clears  返回全部成绩（JSON 数组）
+
+另有札记接口（design/DESIGN.md §8.9）：
+    POST /api/messages  收一批右侧札记，追加到 logs/messages/<runId>.log
+                        （调试模式写 debug.log，没有 runId 的写 norun.log）
 """
 
 import argparse
@@ -33,9 +37,12 @@ NO_CACHE_HEADERS = (
 )
 LOG_DIR = os.path.join(ROOT, 'logs')
 LOG_FILE = os.path.join(LOG_DIR, 'clears.jsonl')
+MSG_DIR = os.path.join(LOG_DIR, 'messages')
 LOG_LOCK = threading.Lock()
 MAX_BODY = 8 * 1024 * 1024
+MSG_BODY_MAX = 1024 * 1024
 ROUTE_MAX = 30000
+MSG_LINES_MAX = 3000
 CONTENT_TYPES = {
     '.js': 'text/javascript',
     '.css': 'text/css; charset=utf-8',
@@ -123,12 +130,62 @@ def validate_clear(rec):
     return None
 
 
-def route_path(clear_id):
-    """路线日志文件路径：logs/routes/<id>.json；id 里的路径字符一律换成下划线。"""
-    safe = ''.join(ch if (ch.isalnum() or ch in '-_.') else '_' for ch in str(clear_id))
+def validate_messages(payload):
+    """检查一批札记是否符合 §8.9 的格式；合格返回 None，否则返回出错原因。"""
+    if not isinstance(payload, dict):
+        return 'body must be a JSON object'
+    run_id = payload.get('runId')
+    if run_id is not None and (not isinstance(run_id, str) or not run_id or len(run_id) > 200):
+        return 'runId must be a non-empty string or null'
+    if not isinstance(payload.get('debug'), bool):
+        return 'debug must be a boolean'
+    lines = payload.get('lines')
+    if not isinstance(lines, list) or not lines:
+        return 'lines must be a non-empty list'
+    if len(lines) > MSG_LINES_MAX:
+        return 'lines must have at most %d entries' % MSG_LINES_MAX
+    for line in lines:
+        if not isinstance(line, dict):
+            return 'lines entries must be objects'
+        for key in ('at', 'v', 'kind', 'text'):
+            if not isinstance(line.get(key), str):
+                return '%s must be a string' % key
+        if not _is_int(line.get('f')) or line['f'] < 1:
+            return 'f must be a positive integer'
+    return None
+
+
+def safe_name(name):
+    """文件名安全化：只留字母数字和 -_.，其余（含路径字符）换成下划线。"""
+    safe = ''.join(ch if (ch.isalnum() or ch in '-_.') else '_' for ch in str(name))
     if not safe or safe.startswith('.'):
         safe = '_' + safe.lstrip('.')
-    return os.path.join(LOG_DIR, 'routes', safe + '.json')
+    return safe
+
+
+def route_path(clear_id):
+    """路线日志文件路径：logs/routes/<id>.json；id 里的路径字符一律换成下划线。"""
+    return os.path.join(LOG_DIR, 'routes', safe_name(clear_id) + '.json')
+
+
+def message_path(run_id, debug):
+    """札记文件路径：logs/messages/<runId>.log；调试写 debug.log，没有 runId 写 norun.log。"""
+    if debug:
+        name = 'debug'
+    elif run_id:
+        name = safe_name(run_id)
+    else:
+        name = 'norun'
+    return os.path.join(MSG_DIR, name + '.log')
+
+
+def write_messages(path, lines):
+    """每条札记一行纯文本：at  v  F<f>  kind  text，text 里的换行换成空格。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'a', encoding='utf-8') as fh:
+        for line in lines:
+            text = line['text'].replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
+            fh.write('%s  %s  F%d  %s  %s\n' % (line['at'], line['v'], line['f'], line['kind'], text))
 
 
 def write_route(clear_id, route):
@@ -215,19 +272,24 @@ class GameHandler(SimpleHTTPRequestHandler):
     def _is_api(self):
         return normalise_path(self.path) == '/api/clears'
 
-    def _post_clear(self):
+    def _read_json(self, limit):
+        """读请求体并解析 JSON；返回 (payload, 出错原因)。"""
         try:
             length = int(self.headers.get('Content-Length') or 0)
         except ValueError:
             length = -1
-        if length <= 0 or length > MAX_BODY:
-            self._send_json(400, {'ok': False, 'error': 'body must be 1-%d bytes' % MAX_BODY})
-            return
+        if length <= 0 or length > limit:
+            return None, 'body must be 1-%d bytes' % limit
         raw = self.rfile.read(length)
         try:
-            rec = json.loads(raw.decode('utf-8'))
+            return json.loads(raw.decode('utf-8')), None
         except (UnicodeDecodeError, ValueError):
-            self._send_json(400, {'ok': False, 'error': 'body is not valid JSON'})
+            return None, 'body is not valid JSON'
+
+    def _post_clear(self):
+        rec, error = self._read_json(MAX_BODY)
+        if error:
+            self._send_json(400, {'ok': False, 'error': error})
             return
         problem = validate_clear(rec)
         if problem:
@@ -251,9 +313,30 @@ class GameHandler(SimpleHTTPRequestHandler):
                 fh.write(json.dumps(rec, ensure_ascii=False) + '\n')
         self._send_json(200, {'ok': True})
 
+    def _post_messages(self):
+        payload, error = self._read_json(MSG_BODY_MAX)
+        if error:
+            self._send_json(400, {'ok': False, 'error': error})
+            return
+        problem = validate_messages(payload)
+        if problem:
+            self._send_json(400, {'ok': False, 'error': problem})
+            return
+        path = message_path(payload.get('runId'), payload['debug'])
+        with LOG_LOCK:
+            try:
+                write_messages(path, payload['lines'])
+            except OSError as exc:
+                self._send_json(500, {'ok': False, 'error': 'cannot write log: %s' % exc})
+                return
+        self._send_json(200, {'ok': True})
+
     def do_POST(self):
-        if self._is_api():
+        path = normalise_path(self.path)
+        if path == '/api/clears':
             self._post_clear()
+        elif path == '/api/messages':
+            self._post_messages()
         else:
             self._not_found()
 

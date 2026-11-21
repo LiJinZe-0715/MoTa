@@ -1,13 +1,20 @@
-/* js/log.js —— 成绩上传（DESIGN.md §8.7）：本机队列 + POST api/clears，失败不影响游戏 */
+/* js/log.js —— 成绩上传（DESIGN.md §8.7）、札记落盘（§8.9）：本机队列 + POST，失败不影响游戏 */
 (function () {
   'use strict';
 
   var RUN_KEY = 'emberTower.runId';
   var QUEUE_KEY = 'emberTower.pendingClears';
   var ROUTE_KEY = 'emberTower.route';
+  var MSG_QUEUE_KEY = 'emberTower.msgQueue';
   var ROUTE_MAX = 30000;
+  var MSG_MAX = 3000;
+  var MSG_TEXT_MAX = 2000;
+  var MSG_BATCH = 500;
+  var MSG_BATCH_BYTES = 800 * 1024;
   var flushing = false;
   var waiters = {};
+  var msgFlushing = false;
+  var msgTimer = null;
 
   function hasOwn(obj, key) {
     return Object.prototype.hasOwnProperty.call(obj, key);
@@ -285,12 +292,143 @@
     }
   }
 
+  /* ---------- 札记落盘（DESIGN §8.9）：每条札记进本机队列，约 1 秒后批量 POST ---------- */
+
+  /* 调试模式写自己的队列键；调试札记也上传（只是本机日志），runId 用 null */
+  function msgQueueKey() {
+    return MSG_QUEUE_KEY + (isDebug() ? '.debug' : '');
+  }
+
+  function readMsgQueue() {
+    var raw = lsGet(msgQueueKey());
+    if (!raw) { return []; }
+    try {
+      var list = JSON.parse(raw);
+      return Array.isArray(list) ? list : [];
+    } catch (err) { return []; }
+  }
+
+  function writeMsgQueue(list) {
+    lsSet(msgQueueKey(), JSON.stringify(list));
+  }
+
+  /* 当前楼层（从 1 起）；还没开局时记 1，保证服务器那边的 f 是正整数 */
+  function currentFloor() {
+    try {
+      var state = window.Game && window.Game.state;
+      var f = (state && typeof state.floor === 'number') ? state.floor + 1 : 0;
+      return f >= 1 ? f : 1;
+    } catch (err) { return 1; }
+  }
+
+  function scheduleMsgFlush() {
+    if (msgTimer || msgFlushing) { return; }
+    try {
+      msgTimer = setTimeout(function () {
+        msgTimer = null;
+        flushMessages();
+      }, 1000);
+    } catch (err) { msgTimer = null; }
+  }
+
+  /* 记一条札记；队满 3000 条时丢最旧的。text 太长就截断，免得一整批超过 1 MB 卡住队列 */
+  function message(text, kind) {
+    try {
+      if (text === null || typeof text === 'undefined') { return; }
+      var body = String(text);
+      if (body.length > MSG_TEXT_MAX) { body = body.slice(0, MSG_TEXT_MAX); }
+      var list = readMsgQueue();
+      list.push({
+        at: new Date().toISOString(),
+        f: currentFloor(),
+        kind: (typeof kind === 'string' && kind) ? kind : 'info',
+        text: body,
+        v: buildTag(currentBuild()),
+        r: isDebug() ? null : (lsGet(RUN_KEY) || null)   /* 记下这条属于哪一局：补传时不会挂到之后新开的局下 */
+      });
+      if (list.length > MSG_MAX) { list = list.slice(list.length - MSG_MAX); }
+      writeMsgQueue(list);
+      scheduleMsgFlush();
+    } catch (err) { /* 札记落盘不能影响游戏 */ }
+  }
+
+  /* 从队头取一批（同一局的连续几条；条数和字节数都留余量），整批上传成功才删 */
+  function takeMsgBatch() {
+    var list = readMsgQueue();
+    var out = [];
+    var bytes = 0;
+    for (var i = 0; i < list.length && out.length < MSG_BATCH; i++) {
+      if (out.length && (list[i] && list[i].r) !== (out[0] && out[0].r)) { break; }
+      var size = 0;
+      try { size = JSON.stringify(list[i]).length + 1; } catch (err) { size = 0; }
+      if (out.length && bytes + size > MSG_BATCH_BYTES) { break; }
+      out.push(list[i]);
+      bytes += size;
+    }
+    return out;
+  }
+
+  /* done(结果)：'ok' 成功；'bad' 服务器说格式不对（这批永远传不上，丢掉免得卡住队列）；其它 = 先留着 */
+  function postMessages(lines, done) {
+    var settled = false;
+    var debug = isDebug();
+    var runId = debug ? null : ((lines[0] && lines[0].r) || null);
+    function finish(ok) {
+      if (settled) { return; }
+      settled = true;
+      done(ok);
+    }
+    var xhr;
+    try {
+      xhr = new XMLHttpRequest();
+      xhr.open('POST', 'api/messages', true);
+      xhr.setRequestHeader('Content-Type', 'application/json');
+      xhr.timeout = 10000;
+    } catch (err) {
+      finish('fail');
+      return;
+    }
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== 4) { return; }
+      var ok = false;
+      try {
+        var res = JSON.parse(xhr.responseText);
+        ok = !!(res && res.ok === true);
+      } catch (err) { ok = false; }
+      finish(ok ? 'ok' : (xhr.status === 400 ? 'bad' : 'fail'));
+    };
+    try {
+      xhr.send(JSON.stringify({ runId: runId, debug: debug, lines: lines }));
+    } catch (err) {
+      finish('fail');
+    }
+  }
+
+  /* 按顺序上传队头的一批；成功就删掉并继续，失败则整队留在本机 */
+  function flushMessages() {
+    if (msgFlushing) { return; }
+    if (!canUpload()) { return; }
+    var batch = takeMsgBatch();
+    if (!batch.length) { return; }
+    msgFlushing = true;
+    postMessages(batch, function (result) {
+      msgFlushing = false;
+      if (result !== 'ok' && result !== 'bad') { return; }
+      var list = readMsgQueue();
+      list.splice(0, batch.length);
+      writeMsgQueue(list);
+      if (list.length) { flushMessages(); }
+    });
+  }
+
   window.RunLog = {
     newRun: newRun,
     route: route,
-    recordClear: recordClear
+    recordClear: recordClear,
+    message: message
   };
 
   /* 页面每次加载都把队列里剩下的按顺序补传（file:// 下不发请求） */
   try { flush(); } catch (err) { /* 忽略 */ }
+  try { flushMessages(); } catch (err) { /* 忽略 */ }
 })();
