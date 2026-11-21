@@ -1,0 +1,16 @@
+# IDE
+.idea/
+*.iml
+
+# 本地开发工具配置（Claude Code 启动配置，含本机 python 路径约定）
+.claude/
+
+# 临时探测脚本（一次性排查环境用）
+.tmp-check/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 成绩上传记录（tools/serve.py 写入）
+logs/
